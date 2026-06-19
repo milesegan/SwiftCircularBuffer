@@ -1,0 +1,209 @@
+import Darwin
+import Synchronization
+import XCTest
+
+@testable import SwiftCircularBuffer
+
+private struct TypedPacket: BitwiseCopyable, Equatable {
+    var marker: UInt8
+    var value: UInt64
+    var code: UInt16
+}
+
+final class CircularBufferTests: XCTestCase {
+    func testCapacityRoundsToPageSize() throws {
+        let buffer = try CircularBuffer(capacity: 1)
+
+        XCTAssertGreaterThanOrEqual(buffer.capacity, Int(getpagesize()))
+        XCTAssertEqual(buffer.availableBytes, 0)
+        XCTAssertEqual(buffer.freeBytes, buffer.capacity)
+    }
+
+    func testHugeCapacityThrowsCapacityTooLarge() {
+        XCTAssertThrowsError(try CircularBuffer(capacity: Int.max)) { error in
+            XCTAssertEqual(error as? CircularBufferError, .capacityTooLarge)
+        }
+    }
+
+    func testWriteReadAndClear() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let input = Array(UInt8(0)..<UInt8(64))
+
+        let wrote = input.withUnsafeBytes { buffer.write($0) }
+        XCTAssertTrue(wrote)
+        XCTAssertEqual(buffer.availableBytes, input.count)
+
+        var output = [UInt8](repeating: 0, count: input.count)
+        let read = output.withUnsafeMutableBytes { buffer.read(into: $0) }
+        XCTAssertEqual(read, input.count)
+        XCTAssertEqual(output, input)
+        XCTAssertEqual(buffer.availableBytes, 0)
+
+        input.withUnsafeBytes { XCTAssertTrue(buffer.write($0)) }
+        buffer.clear()
+        XCTAssertEqual(buffer.availableBytes, 0)
+        XCTAssertEqual(buffer.freeBytes, buffer.capacity)
+    }
+
+    func testMirroredWraparoundReadWrite() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let filler = [UInt8](repeating: 0xAA, count: buffer.capacity - 8)
+        filler.withUnsafeBytes { XCTAssertTrue(buffer.write($0)) }
+        buffer.consume(filler.count)
+
+        let wrapped = (0..<64).map(UInt8.init)
+        wrapped.withUnsafeBytes { XCTAssertTrue(buffer.write($0)) }
+
+        var output = [UInt8](repeating: 0, count: wrapped.count)
+        let read = output.withUnsafeMutableBytes { buffer.read(into: $0) }
+        XCTAssertEqual(read, wrapped.count)
+        XCTAssertEqual(output, wrapped)
+    }
+
+    func testClosureBasedAPIs() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+
+        let produced = buffer.write(maximumBytes: 16) { writable in
+            for index in 0..<writable.count {
+                writable[index] = UInt8(index)
+            }
+            return writable.count
+        }
+        XCTAssertEqual(produced, 16)
+
+        var values: [UInt8] = []
+        let consumed = buffer.read(maximumBytes: 16) { readable in
+            values = Array(readable)
+            return readable.count
+        }
+
+        XCTAssertEqual(consumed, 16)
+        XCTAssertEqual(values, Array(UInt8(0)..<UInt8(16)))
+    }
+
+    func testTypedValueReadWrite() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let packet = TypedPacket(marker: 0xAB, value: 0x0102_0304_0506_0708, code: 0xCAFE)
+
+        XCTAssertTrue(buffer.write(packet))
+        XCTAssertEqual(buffer.availableBytes, MemoryLayout<TypedPacket>.size)
+
+        let output = buffer.read(as: TypedPacket.self)
+        XCTAssertEqual(output, packet)
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testTypedReadReturnsNilWhenIncompleteValueIsAvailable() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let byte = [UInt8(0x01)]
+
+        byte.withUnsafeBytes { XCTAssertTrue(buffer.write($0)) }
+
+        let value = buffer.read(as: UInt16.self)
+        XCTAssertNil(value)
+        XCTAssertEqual(buffer.availableBytes, 1)
+    }
+
+    func testTypedBufferReadWrite() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let values: [UInt32] = [10, 20, 30, 40, 50]
+
+        values.withUnsafeBufferPointer { valueBuffer in
+            XCTAssertTrue(buffer.write(valueBuffer))
+        }
+        XCTAssertEqual(buffer.availableBytes, values.count * MemoryLayout<UInt32>.size)
+
+        var firstOutput = [UInt32](repeating: 0, count: 3)
+        let firstRead = firstOutput.withUnsafeMutableBufferPointer { outputBuffer in
+            buffer.read(into: outputBuffer)
+        }
+        XCTAssertEqual(firstRead, 3)
+        XCTAssertEqual(firstOutput, [10, 20, 30])
+
+        var secondOutput = [UInt32](repeating: 0, count: 4)
+        let secondRead = secondOutput.withUnsafeMutableBufferPointer { outputBuffer in
+            buffer.read(into: outputBuffer)
+        }
+        XCTAssertEqual(secondRead, 2)
+        XCTAssertEqual(Array(secondOutput.prefix(2)), [40, 50])
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testTypedBufferWriteFailsWithoutEnoughFreeSpace() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let values = [UInt64](repeating: 42, count: buffer.capacity / MemoryLayout<UInt64>.size + 1)
+
+        values.withUnsafeBufferPointer { valueBuffer in
+            XCTAssertFalse(buffer.write(valueBuffer))
+        }
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testEmptyTypedBufferOperationsAreNoops() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let values: [UInt32] = []
+
+        values.withUnsafeBufferPointer { valueBuffer in
+            XCTAssertTrue(buffer.write(valueBuffer))
+        }
+
+        var output: [UInt32] = []
+        let read = output.withUnsafeMutableBufferPointer { outputBuffer in
+            buffer.read(into: outputBuffer)
+        }
+        XCTAssertEqual(read, 0)
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testSingleProducerSingleConsumerStress() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let total = 50_000
+        let producerDone = Atomic(false)
+        let failure = Atomic(false)
+
+        let producer = Thread {
+            for value in 0..<total {
+                let byte = UInt8(truncatingIfNeeded: value)
+                while true {
+                    var local = byte
+                    let wrote = withUnsafeBytes(of: &local) { buffer.write($0) }
+                    if wrote {
+                        break
+                    }
+                    sched_yield()
+                }
+            }
+            producerDone.store(true, ordering: .releasing)
+        }
+
+        let consumer = Thread {
+            var expected = 0
+            var byte = UInt8.zero
+            while expected < total {
+                let read = withUnsafeMutableBytes(of: &byte) { buffer.read(into: $0) }
+                if read == 0 {
+                    if producerDone.load(ordering: .acquiring) {
+                        sched_yield()
+                    }
+                    continue
+                }
+
+                if byte != UInt8(truncatingIfNeeded: expected) {
+                    failure.store(true, ordering: .releasing)
+                    return
+                }
+                expected += 1
+            }
+        }
+
+        producer.start()
+        consumer.start()
+
+        while !producer.isFinished || !consumer.isFinished {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+
+        XCTAssertFalse(failure.load(ordering: .acquiring))
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+}
