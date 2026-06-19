@@ -119,6 +119,12 @@ When using a restricted sandbox, the Swift module cache may need to be redirecte
 swift test -Xswiftc -module-cache-path -Xswiftc /tmp/swift-module-cache
 ```
 
+## Acknowledgements
+
+Thanks to Michael Tyson for the circular virtual memory mapping technique in
+[`TPCircularBuffer`](https://github.com/michaeltyson/TPCircularBuffer), which inspired the storage
+model used by this package.
+
 ## License
 
 SwiftCircularBuffer is available under the MIT license. See [LICENSE](LICENSE).
