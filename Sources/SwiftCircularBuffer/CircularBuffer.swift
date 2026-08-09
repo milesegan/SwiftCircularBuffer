@@ -42,7 +42,28 @@ public final class CircularBuffer: @unchecked Sendable {
     ///
     /// - Parameter requestedCapacity: The minimum usable capacity in bytes.
     /// - Throws: `CircularBufferError` if the capacity is invalid or virtual memory setup fails.
-    public init(capacity requestedCapacity: Int) throws {
+    public convenience init(capacity requestedCapacity: Int) throws {
+        try self.init(
+            capacity: requestedCapacity,
+            attemptLimit: Self.mappingAttemptLimit,
+            remap: Self.remapMirror
+        )
+    }
+
+    /// Creates a circular buffer with an overridable mapping strategy.
+    ///
+    /// Tests use this to simulate the transient mapping failures the retry loop exists for.
+    ///
+    /// - Parameters:
+    ///   - requestedCapacity: The minimum usable capacity in bytes.
+    ///   - attemptLimit: The number of mapping attempts before the failure is reported.
+    ///   - remap: The mirror mapping call to use.
+    /// - Throws: `CircularBufferError` if the capacity is invalid or virtual memory setup fails.
+    init(
+        capacity requestedCapacity: Int,
+        attemptLimit: Int,
+        remap: RemapMirror
+    ) throws {
         guard requestedCapacity > 0 else {
             throw CircularBufferError.invalidCapacity
         }
@@ -58,56 +79,11 @@ public final class CircularBuffer: @unchecked Sendable {
         }
 
         let length = vm_size_t(roundedCapacity)
-        var address: vm_address_t = 0
-
-        // Reserve two adjacent regions so the second half can be replaced with a mirror
-        // of the first half.
-        let allocationResult = vm_allocate(
-            mach_task_self_,
-            &address,
-            length * 2,
-            VM_FLAGS_ANYWHERE
+        let address = try Self.makeMirroredMapping(
+            length: length,
+            attemptLimit: attemptLimit,
+            remap: remap
         )
-        guard allocationResult == KERN_SUCCESS else {
-            throw CircularBufferError.allocationFailed(allocationResult)
-        }
-
-        let mirrorStart = address + vm_address_t(length)
-
-        // Free the second half of the reservation while keeping the address range available
-        // for the fixed-address remap below.
-        let deallocateResult = vm_deallocate(mach_task_self_, mirrorStart, length)
-        guard deallocateResult == KERN_SUCCESS else {
-            vm_deallocate(mach_task_self_, address, length * 2)
-            throw CircularBufferError.allocationFailed(deallocateResult)
-        }
-
-        var mirrorAddress = mirrorStart
-        var currentProtection: vm_prot_t = 0
-        var maximumProtection: vm_prot_t = 0
-
-        // Map the first half again immediately after itself. Pointer arithmetic can then
-        // read or write across the logical wrap point without splitting the operation.
-        let remapResult = vm_remap(
-            mach_task_self_,
-            &mirrorAddress,
-            length,
-            0,
-            0,
-            mach_task_self_,
-            address,
-            0,
-            &currentProtection,
-            &maximumProtection,
-            VM_INHERIT_DEFAULT
-        )
-        guard remapResult == KERN_SUCCESS, mirrorAddress == mirrorStart else {
-            if remapResult == KERN_SUCCESS {
-                vm_deallocate(mach_task_self_, mirrorAddress, length)
-            }
-            vm_deallocate(mach_task_self_, address, length)
-            throw CircularBufferError.remapFailed(remapResult)
-        }
 
         self.capacity = roundedCapacity
         self.baseAddress = UnsafeMutableRawPointer(bitPattern: UInt(address))!
@@ -115,6 +91,109 @@ public final class CircularBuffer: @unchecked Sendable {
         self.fillCount = Atomic(0)
         self.headOffset = 0
         self.tailOffset = 0
+    }
+
+    /// A mirror mapping call: maps `size` bytes of `source` at `target`, updating `target`
+    /// with the address the kernel actually used.
+    typealias RemapMirror = (
+        _ target: inout vm_address_t,
+        _ size: vm_size_t,
+        _ source: vm_address_t
+    ) -> kern_return_t
+
+    /// How many times mirrored mapping setup is attempted before the failure is reported.
+    ///
+    /// Reserving the range and mapping the mirror into it are separate kernel calls, so an
+    /// unrelated mapping in this process can claim the mirror's address range in between.
+    /// That race is transient, so a fresh reservation is worth trying.
+    private static let mappingAttemptLimit = 5
+
+    /// Reserves `length * 2` bytes and maps the first half over the second half.
+    ///
+    /// - Parameters:
+    ///   - length: The page-aligned length of one half of the mapping.
+    ///   - attemptLimit: The number of reserve-and-remap attempts before giving up.
+    ///   - remap: The mirror mapping call to use.
+    /// - Returns: The base address of the mirrored mapping.
+    /// - Throws: `CircularBufferError` if the reservation or every mapping attempt fails.
+    private static func makeMirroredMapping(
+        length: vm_size_t,
+        attemptLimit: Int,
+        remap: RemapMirror
+    ) throws -> vm_address_t {
+        precondition(attemptLimit > 0, "Mapping needs at least one attempt")
+        var lastRemapResult = KERN_NO_SPACE
+
+        for _ in 0..<attemptLimit {
+            var address: vm_address_t = 0
+
+            // Reserve two adjacent regions so the second half can be replaced with a mirror
+            // of the first half.
+            let allocationResult = vm_allocate(
+                mach_task_self_,
+                &address,
+                length * 2,
+                VM_FLAGS_ANYWHERE
+            )
+            guard allocationResult == KERN_SUCCESS else {
+                throw CircularBufferError.allocationFailed(allocationResult)
+            }
+
+            let mirrorStart = address + vm_address_t(length)
+
+            // Free the second half of the reservation while keeping the address range available
+            // for the fixed-address remap below.
+            let deallocateResult = vm_deallocate(mach_task_self_, mirrorStart, length)
+            guard deallocateResult == KERN_SUCCESS else {
+                vm_deallocate(mach_task_self_, address, length * 2)
+                throw CircularBufferError.allocationFailed(deallocateResult)
+            }
+
+            // Map the first half again immediately after itself. Pointer arithmetic can then
+            // read or write across the logical wrap point without splitting the operation.
+            var mirrorAddress = mirrorStart
+            let remapResult = remap(&mirrorAddress, length, address)
+
+            if remapResult == KERN_SUCCESS, mirrorAddress == mirrorStart {
+                return address
+            }
+
+            // Something else took the mirror's address range between the reservation and the
+            // remap. Release everything and start over from a fresh reservation.
+            if remapResult == KERN_SUCCESS {
+                vm_deallocate(mach_task_self_, mirrorAddress, length)
+                lastRemapResult = KERN_NO_SPACE
+            } else {
+                lastRemapResult = remapResult
+            }
+            vm_deallocate(mach_task_self_, address, length)
+        }
+
+        throw CircularBufferError.remapFailed(lastRemapResult)
+    }
+
+    /// Maps `source` at `target` with `vm_remap`, sharing rather than copying the pages.
+    static func remapMirror(
+        target: inout vm_address_t,
+        size: vm_size_t,
+        source: vm_address_t
+    ) -> kern_return_t {
+        var currentProtection: vm_prot_t = 0
+        var maximumProtection: vm_prot_t = 0
+
+        return vm_remap(
+            mach_task_self_,
+            &target,
+            size,
+            0,
+            0,
+            mach_task_self_,
+            source,
+            0,
+            &currentProtection,
+            &maximumProtection,
+            VM_INHERIT_DEFAULT
+        )
     }
 
     deinit {
