@@ -62,6 +62,8 @@ extension CircularBuffer {
     ///
     /// The returned list points directly into the circular buffer's storage. Fill the buffers,
     /// optionally adjust each buffer's `mDataByteSize`, then call `produceAudioBufferList()`.
+    /// Only the block metadata is initialized; the audio payload holds whatever the storage
+    /// last contained until the caller writes it.
     ///
     /// - Parameters:
     ///   - bufferCount: The number of audio buffers in the list.
@@ -90,8 +92,9 @@ extension CircularBuffer {
         }
 
         // Keep audio payloads 16-byte aligned so callers can use vectorized audio routines
-        // without a separate copy.
-        block.initializeMemory(as: UInt8.self, repeating: 0, count: totalLength)
+        // without a separate copy. Zero just the header and list: the caller overwrites the
+        // payload, so clearing it first would only add a second pass over every frame.
+        block.initializeMemory(as: UInt8.self, repeating: 0, count: dataOffset)
         AudioBlockLayout.timestampPointer(in: block).pointee = timestamp ?? AudioTimeStamp()
         AudioBlockLayout.totalLengthPointer(in: block).pointee = UInt32(totalLength)
 

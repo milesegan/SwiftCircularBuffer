@@ -353,17 +353,14 @@ public final class CircularBuffer: @unchecked Sendable {
             return nil
         }
 
-        let pointer = UnsafeMutableRawPointer.allocate(
+        return withUnsafeTemporaryAllocation(
             byteCount: byteCount,
             alignment: MemoryLayout<T>.alignment
-        )
-        defer {
-            pointer.deallocate()
+        ) { scratch in
+            let readCount = read(into: scratch)
+            precondition(readCount == byteCount, "Typed read consumed an unexpected byte count")
+            return scratch.load(as: T.self)
         }
-
-        let readCount = read(into: UnsafeMutableRawBufferPointer(start: pointer, count: byteCount))
-        precondition(readCount == byteCount, "Typed read consumed an unexpected byte count")
-        return pointer.load(as: T.self)
     }
 
     /// Copies a buffer of bitwise-copyable values into the ring.
