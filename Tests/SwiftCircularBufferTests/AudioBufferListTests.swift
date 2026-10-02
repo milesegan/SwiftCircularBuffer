@@ -187,6 +187,80 @@ final class AudioBufferListTests: XCTestCase {
         XCTAssertEqual(outTimestamp.mSampleTime, 0)
     }
 
+    func testDequeueDropsSubFrameRemnantAndReachesNextBlock() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = interleavedFormat(bytesPerFrame: 4, channels: 1)
+        let first = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 6)
+        first.fill(buffer: 0, with: [1, 2, 3, 4, 5, 6])
+        XCTAssertTrue(buffer.copyAudioBufferList(UnsafePointer(first.list)))
+        let second = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 4)
+        second.fill(buffer: 0, with: [9, 9, 9, 9])
+        XCTAssertTrue(buffer.copyAudioBufferList(UnsafePointer(second.list)))
+
+        let output = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 16)
+        var frames: UInt32 = 4
+        buffer.dequeueAudioBufferListFrames(&frames, into: UnsafePointer(output.list), format: format)
+
+        XCTAssertEqual(frames, 2)
+        XCTAssertEqual(output.bytes(buffer: 0, count: 8), [1, 2, 3, 4, 9, 9, 9, 9])
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testDequeueAllFramesDoesNotOverflow() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = interleavedFormat(bytesPerFrame: 4, channels: 1)
+        let input = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 8)
+        XCTAssertTrue(buffer.copyAudioBufferList(UnsafePointer(input.list)))
+
+        var frames = circularBufferCopyAllFrames
+        buffer.dequeueAudioBufferListFrames(&frames, format: format)
+
+        XCTAssertEqual(frames, 2)
+        XCTAssertEqual(buffer.availableBytes, 0)
+    }
+
+    func testPrepareReturnsNilWhenByteCountOverflows() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = interleavedFormat(bytesPerFrame: 8, channels: 2)
+
+        XCTAssertNil(buffer.prepareAudioBufferList(format: format, frameCount: UInt32.max))
+    }
+
+    func testZeroBytesPerFrameReportsNoFrames() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = interleavedFormat(bytesPerFrame: 0, channels: 1)
+        let input = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 8)
+        XCTAssertTrue(buffer.copyAudioBufferList(UnsafePointer(input.list)))
+
+        XCTAssertEqual(buffer.availableAudioBufferListFrames(format: format), 0)
+        XCTAssertEqual(buffer.peekAudioBufferListFrames(format: format), 0)
+        var frames: UInt32 = 4
+        buffer.dequeueAudioBufferListFrames(&frames, format: format)
+        XCTAssertEqual(frames, 0)
+    }
+
+    func testPeekCountsOnlyWholeFramesPerBlock() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = interleavedFormat(bytesPerFrame: 4, channels: 1)
+        for _ in 0..<2 {
+            let input = AudioBufferListBox(bufferCount: 1, bytesPerBuffer: 6)
+            XCTAssertTrue(buffer.copyAudioBufferList(UnsafePointer(input.list)))
+        }
+
+        XCTAssertEqual(buffer.peekAudioBufferListFrames(format: format), 2)
+        var frames: UInt32 = 8
+        buffer.dequeueAudioBufferListFrames(&frames, format: format)
+        XCTAssertEqual(frames, 2)
+    }
+
+    func testZeroChannelNonInterleavedFormatReportsNoSpace() throws {
+        let buffer = try CircularBuffer(capacity: 4096)
+        let format = nonInterleavedFormat(bytesPerFrame: 4, channels: 0)
+
+        XCTAssertEqual(buffer.availableAudioBufferListFrames(format: format), 0)
+        XCTAssertNil(buffer.prepareAudioBufferList(format: format, frameCount: 4))
+    }
+
     private func interleavedFormat(
         bytesPerFrame: UInt32,
         channels: UInt32
@@ -199,7 +273,7 @@ final class AudioBufferListTests: XCTestCase {
             mFramesPerPacket: 1,
             mBytesPerFrame: bytesPerFrame,
             mChannelsPerFrame: channels,
-            mBitsPerChannel: 8 * bytesPerFrame / channels,
+            mBitsPerChannel: 8 * bytesPerFrame / max(channels, 1),
             mReserved: 0
         )
     }

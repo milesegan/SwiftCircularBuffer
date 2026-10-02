@@ -18,18 +18,14 @@ private enum AudioBlockLayout {
     static let totalLengthOffset = MemoryLayout<AudioBlockHeader>.offset(of: \.totalLength)!
     static let bufferListOffset = MemoryLayout<AudioBlockHeader>.offset(of: \.bufferList)!
 
-    static func align16(_ value: Int) -> Int {
+    static func align16<T: FixedWidthInteger>(_ value: T) -> T {
         (value + 15) & ~15
     }
 
-    static func audioBufferListByteCount(bufferCount: Int) -> Int {
+    static func metadataLength<T: FixedWidthInteger>(bufferCount: T) -> T {
         precondition(bufferCount > 0, "AudioBufferList must contain at least one buffer")
-        return MemoryLayout<AudioBufferList>.size
-            + (bufferCount - 1) * MemoryLayout<AudioBuffer>.stride
-    }
-
-    static func metadataLength(bufferCount: Int) -> Int {
-        bufferListOffset + audioBufferListByteCount(bufferCount: bufferCount)
+        return T(bufferListOffset + MemoryLayout<AudioBufferList>.size)
+            + (bufferCount - 1) * T(MemoryLayout<AudioBuffer>.stride)
     }
 
     static func timestampPointer(
@@ -61,7 +57,8 @@ extension CircularBuffer {
     /// Reserves space at the producer head for an `AudioBufferList` with uniform buffer sizes.
     ///
     /// The returned list points directly into the circular buffer's storage. Fill the buffers,
-    /// optionally adjust each buffer's `mDataByteSize`, then call `produceAudioBufferList()`.
+    /// optionally reduce `mDataByteSize` (to the same value in every buffer, since consumers
+    /// size every buffer by the first one), then call `produceAudioBufferList()`.
     /// Only the block metadata is initialized; the audio payload holds whatever the storage
     /// last contained until the caller writes it.
     ///
@@ -82,14 +79,21 @@ extension CircularBuffer {
             return nil
         }
 
-        let bufferCountInt = Int(bufferCount)
-        let metadataLength = AudioBlockLayout.metadataLength(bufferCount: bufferCountInt)
-        let dataOffset = AudioBlockLayout.align16(metadataLength)
-        let dataBytes = bufferCountInt * Int(bytesPerBuffer)
-        let totalLength = AudioBlockLayout.align16(dataOffset + dataBytes)
-        guard totalLength <= writable.count, totalLength <= Int(UInt32.max) else {
+        // Size the block in UInt64: where Int is 32 bits, Int math could overflow on an
+        // oversized request instead of reporting that it does not fit. Once it fits in
+        // `writable`, every size below is representable as an Int.
+        let metadataLength = AudioBlockLayout.metadataLength(bufferCount: UInt64(bufferCount))
+        let dataOffset64 = AudioBlockLayout.align16(metadataLength)
+        let totalLength64 = AudioBlockLayout.align16(
+            dataOffset64 + UInt64(bufferCount) * UInt64(bytesPerBuffer)
+        )
+        guard totalLength64 <= UInt64(writable.count) else {
             return nil
         }
+
+        let bufferCountInt = Int(bufferCount)
+        let dataOffset = Int(dataOffset64)
+        let totalLength = Int(totalLength64)
 
         // Keep audio payloads 16-byte aligned so callers can use vectorized audio routines
         // without a separate copy. Zero just the header and list: the caller overwrites the
@@ -129,10 +133,13 @@ extension CircularBuffer {
     ) -> UnsafeMutableAudioBufferListPointer? {
         let isNonInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
         let bufferCount = isNonInterleaved ? format.mChannelsPerFrame : 1
-        guard
+        let (bytesPerBuffer, overflow) = frameCount.multipliedReportingOverflow(
+            by: format.mBytesPerFrame
+        )
+        guard !overflow,
             let list = prepareAudioBufferList(
                 bufferCount: bufferCount,
-                bytesPerBuffer: frameCount * format.mBytesPerFrame,
+                bytesPerBuffer: bytesPerBuffer,
                 timestamp: timestamp
             )
         else {
@@ -150,7 +157,8 @@ extension CircularBuffer {
     /// Commits the `AudioBufferList` most recently returned by `prepareAudioBufferList`.
     ///
     /// - Parameter timestamp: An optional timestamp that replaces the prepared timestamp.
-    /// - Precondition: A prepared list exists at the producer head and contains audio data.
+    /// - Precondition: A prepared list exists at the producer head and contains audio data, and
+    ///   every buffer has the same `mDataByteSize`.
     public func produceAudioBufferList(timestamp: AudioTimeStamp? = nil) {
         guard let writable = head(), let block = writable.baseAddress else {
             preconditionFailure("No prepared AudioBufferList is available to produce")
@@ -162,7 +170,14 @@ extension CircularBuffer {
 
         let list = UnsafeMutableAudioBufferListPointer(AudioBlockLayout.bufferListPointer(in: block))
         precondition(!list.isEmpty, "Prepared AudioBufferList has no buffers")
-        precondition(list[0].mDataByteSize > 0, "Prepared AudioBufferList has no audio data")
+        let byteSize = list[0].mDataByteSize
+        precondition(byteSize > 0, "Prepared AudioBufferList has no audio data")
+        // The block is sized from the last buffer while consumers read every buffer using the
+        // first one's size, so differing sizes would read outside the committed block.
+        precondition(
+            list.allSatisfy { $0.mDataByteSize == byteSize },
+            "Prepared AudioBufferList buffers must share one mDataByteSize"
+        )
 
         let lastBuffer = list[list.count - 1]
         let lastData = UnsafeMutableRawPointer(lastBuffer.mData!)
@@ -329,6 +344,7 @@ extension CircularBuffer {
         format: AudioStreamBasicDescription
     ) {
         guard frames > 0,
+            format.mBytesPerFrame > 0,
             let readable = tail(),
             let blockRaw = readable.baseAddress
         else {
@@ -341,15 +357,15 @@ extension CircularBuffer {
             return
         }
 
-        let bytesToConsume = Swift.min(
-            frames * format.mBytesPerFrame,
-            list[0].mDataByteSize
-        )
+        let (requestedBytes, overflow) = frames.multipliedReportingOverflow(by: format.mBytesPerFrame)
+        let bytesToConsume = overflow ? list[0].mDataByteSize : Swift.min(requestedBytes, list[0].mDataByteSize)
         guard bytesToConsume > 0 else {
             return
         }
 
-        if bytesToConsume == list[0].mDataByteSize {
+        // A remnant shorter than one frame can never be dequeued and would wedge the queue
+        // behind it, so it goes with the rest of the block.
+        if list[0].mDataByteSize - bytesToConsume < format.mBytesPerFrame {
             consumeNextAudioBufferList()
             return
         }
@@ -400,7 +416,15 @@ extension CircularBuffer {
         timestamp: UnsafeMutablePointer<AudioTimeStamp>? = nil,
         format: AudioStreamBasicDescription
     ) {
-        var bytesRemaining = frameCount * format.mBytesPerFrame
+        let bytesPerFrame = format.mBytesPerFrame
+        guard bytesPerFrame > 0 else {
+            frameCount = 0
+            return
+        }
+
+        // A request too large to express in bytes just asks for everything queued.
+        let (requestedBytes, overflow) = frameCount.multipliedReportingOverflow(by: bytesPerFrame)
+        var bytesRemaining = overflow ? UInt32.max / bytesPerFrame * bytesPerFrame : requestedBytes
         var bytesCopied: UInt32 = 0
         var capturedTimestamp = false
 
@@ -410,8 +434,17 @@ extension CircularBuffer {
                 break
             }
 
+            // Copy whole frames only, so output stays frame aligned and every copied byte is
+            // also consumed. A block holding less than one frame is dropped.
+            let blockBytes = list[0].mDataByteSize
+            let wholeFrameBytes = blockBytes - blockBytes % bytesPerFrame
+            guard wholeFrameBytes > 0 else {
+                consumeNextAudioBufferList()
+                continue
+            }
+
             capturedTimestamp = true
-            let bytesToCopy = Swift.min(bytesRemaining, list[0].mDataByteSize)
+            let bytesToCopy = Swift.min(bytesRemaining, wholeFrameBytes)
 
             if let output {
                 let outputList = UnsafeMutableAudioBufferListPointer(
@@ -431,14 +464,14 @@ extension CircularBuffer {
             }
 
             consumeNextAudioBufferListPartial(
-                frames: bytesToCopy / format.mBytesPerFrame,
+                frames: bytesToCopy / bytesPerFrame,
                 format: format
             )
             bytesRemaining -= bytesToCopy
             bytesCopied += bytesToCopy
         }
 
-        frameCount = bytesCopied / format.mBytesPerFrame
+        frameCount = bytesCopied / bytesPerFrame
     }
 
     /// Returns the number of readable frames across queued audio blocks.
@@ -473,7 +506,8 @@ extension CircularBuffer {
         contiguousToleranceSampleTime: UInt32,
         wrapPoint: UInt32 = 0
     ) -> UInt32 {
-        guard let readable = tail(),
+        guard format.mBytesPerFrame > 0,
+            let readable = tail(),
             let tailBlockRaw = readable.baseAddress
         else {
             timestamp?.pointee = AudioTimeStamp()
@@ -484,14 +518,16 @@ extension CircularBuffer {
         let end = block.advanced(by: readable.count)
         timestamp?.pointee = AudioBlockLayout.timestampPointer(in: block).pointee
 
-        var byteCount: UInt32 = 0
+        var frameCount: UInt32 = 0
         while true {
             let list = UnsafeMutableAudioBufferListPointer(AudioBlockLayout.bufferListPointer(in: block))
             guard !list.isEmpty else {
                 break
             }
 
-            byteCount += list[0].mDataByteSize
+            // Count per block: dequeue drops each block's sub-frame remnant, so summing bytes
+            // across blocks would promise frames that can never be read.
+            frameCount += list[0].mDataByteSize / format.mBytesPerFrame
             let nextBlock = block.advanced(
                 by: Int(AudioBlockLayout.totalLengthPointer(in: block).pointee)
             )
@@ -520,7 +556,7 @@ extension CircularBuffer {
             block = nextBlock
         }
 
-        return byteCount / format.mBytesPerFrame
+        return frameCount
     }
 
     /// Returns the number of frames that can fit in a newly prepared audio buffer list.
@@ -530,12 +566,16 @@ extension CircularBuffer {
     public func availableAudioBufferListFrames(
         format: AudioStreamBasicDescription
     ) -> UInt32 {
-        guard let writable = head(), let block = writable.baseAddress else {
+        guard format.mBytesPerFrame > 0, let writable = head() else {
             return 0
         }
 
         let isNonInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
         let bufferCount = Int(isNonInterleaved ? format.mChannelsPerFrame : 1)
+        guard bufferCount > 0 else {
+            return 0
+        }
+
         let dataOffset = AudioBlockLayout.align16(
             AudioBlockLayout.metadataLength(bufferCount: bufferCount)
         )
@@ -543,9 +583,7 @@ extension CircularBuffer {
             return 0
         }
 
-        let dataStart = block.advanced(by: dataOffset)
-        let dataEnd = block.advanced(by: writable.count)
-        let availableAudioBytes = dataEnd - dataStart
+        let availableAudioBytes = writable.count - dataOffset
         let availableBytesPerBuffer = (availableAudioBytes / bufferCount) & ~15
         return availableBytesPerBuffer > 0
             ? UInt32(availableBytesPerBuffer) / format.mBytesPerFrame

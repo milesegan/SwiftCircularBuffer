@@ -45,6 +45,14 @@ final class CircularBufferTests: XCTestCase {
         XCTAssertEqual(buffer.freeBytes, buffer.capacity)
     }
 
+    func testEmptyWriteSucceedsWhenFull() throws {
+        let buffer = try CircularBuffer(capacity: 1)
+        buffer.produce(buffer.capacity)
+
+        XCTAssertTrue([UInt8]().withUnsafeBytes { buffer.write($0) })
+        XCTAssertEqual(buffer.availableBytes, buffer.capacity)
+    }
+
     func testMirroredWraparoundReadWrite() throws {
         let buffer = try CircularBuffer(capacity: 4096)
         assertMirrorWrapsCorrectly(buffer)

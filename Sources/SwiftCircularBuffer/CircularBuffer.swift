@@ -68,16 +68,15 @@ public final class CircularBuffer: @unchecked Sendable {
             throw CircularBufferError.invalidCapacity
         }
 
-        let pageSize = Int(getpagesize())
-        guard requestedCapacity <= Int(UInt32.max) else {
+        // Size math runs in UInt64 so it neither overflows nor traps where Int is 32 bits
+        // (arm64_32 watchOS), where even Int(UInt32.max) is unrepresentable.
+        let pageSize = UInt64(getpagesize())
+        let rounded = (UInt64(requestedCapacity) + pageSize - 1) / pageSize * pageSize
+        guard rounded <= UInt64(UInt32.max), rounded <= UInt64(Int.max / 2) else {
             throw CircularBufferError.capacityTooLarge
         }
 
-        let roundedCapacity = ((requestedCapacity + pageSize - 1) / pageSize) * pageSize
-        guard roundedCapacity <= Int(UInt32.max), roundedCapacity <= Int.max / 2 else {
-            throw CircularBufferError.capacityTooLarge
-        }
-
+        let roundedCapacity = Int(rounded)
         let length = vm_size_t(roundedCapacity)
         let address = try Self.makeMirroredMapping(
             length: length,
@@ -293,6 +292,9 @@ public final class CircularBuffer: @unchecked Sendable {
     /// - Returns: `true` when all bytes were written; otherwise `false` and the buffer is unchanged.
     @discardableResult
     public func write(_ source: borrowing UnsafeRawBufferPointer) -> Bool {
+        guard !source.isEmpty else {
+            return true
+        }
         guard source.count <= freeBytes, let destination = head() else {
             return false
         }
@@ -349,18 +351,13 @@ public final class CircularBuffer: @unchecked Sendable {
     public func read<T: BitwiseCopyable>(as type: T.Type = T.self) -> T? {
         let byteCount = MemoryLayout<T>.size
         precondition(byteCount > 0, "Cannot read a zero-sized value")
-        guard availableBytes >= byteCount else {
+        guard let source = tail(), source.count >= byteCount else {
             return nil
         }
 
-        return withUnsafeTemporaryAllocation(
-            byteCount: byteCount,
-            alignment: MemoryLayout<T>.alignment
-        ) { scratch in
-            let readCount = read(into: scratch)
-            precondition(readCount == byteCount, "Typed read consumed an unexpected byte count")
-            return scratch.load(as: T.self)
-        }
+        let value = source.loadUnaligned(as: T.self)
+        consume(byteCount)
+        return value
     }
 
     /// Copies a buffer of bitwise-copyable values into the ring.
@@ -380,6 +377,14 @@ public final class CircularBuffer: @unchecked Sendable {
         precondition(byteCount > 0, "Cannot write zero-sized values")
         guard values.count <= Int.max / byteCount, values.count * byteCount <= freeBytes else {
             return false
+        }
+
+        // Without inter-element padding the packed sequence is the buffer's own bytes, so it
+        // can go in as one copy and one publish.
+        if byteCount == MemoryLayout<T>.stride {
+            let wrote = write(UnsafeRawBufferPointer(values))
+            precondition(wrote, "Typed buffer write failed after capacity preflight")
+            return true
         }
 
         for index in values.indices {
@@ -413,6 +418,16 @@ public final class CircularBuffer: @unchecked Sendable {
         let elementCount = Swift.min(destination.count, availableBytes / byteCount)
         guard elementCount > 0 else {
             return 0
+        }
+
+        if byteCount == MemoryLayout<T>.stride {
+            let bytes = UnsafeMutableRawBufferPointer(
+                start: destination.baseAddress,
+                count: elementCount * byteCount
+            )
+            let readCount = read(into: bytes)
+            precondition(readCount == bytes.count, "Typed buffer read consumed an unexpected byte count")
+            return elementCount
         }
 
         for index in 0..<elementCount {
