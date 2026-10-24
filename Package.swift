@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -25,3 +25,9 @@ let package = Package(
         ),
     ]
 )
+
+// Hold the package's own code to a clean diagnostic record. Packages that depend
+// on this one are unaffected.
+for target in package.targets {
+    target.swiftSettings = (target.swiftSettings ?? []) + [.treatAllWarnings(as: .error)]
+}
